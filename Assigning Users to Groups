@@ -1,0 +1,178 @@
+#!/bin/bash
+
+
+if [ $# -eq 5 ]
+then
+	DIRSRV_USER="$1"
+	DIRSRV_USER_PWD="$2"
+	BASE_DN="$3"
+	LB_FQDN="$4"
+	SYSTEMUSERLIST_FILE_PATH=$5
+else
+	echo "[ERROR] All needed arguments not passed to the script"
+	exit 1
+fi	
+
+LDAP_PORT=389
+TMP_DIR="/var/tmp/"
+STATUS_FILE_DIR="/d/oss/global/etc/NSN-SM/"
+STATUS_FILE=".addingUsersToSSHaccessGroupCheck.txt"
+LDIF_FILE_NAME="ldapmodify_for_SFTP.ldif"
+LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE="ldapSearchWithAllEntries.txt"
+TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE="tmp_ldapSearchWithAllEntries.txt"
+LDAP_SEARCH_END_USERS_RESULT_FILE="ldapSearchWithEndUserEntries.txt"
+TMP_LDAP_SEARCH_END_USERS_RESULT_FILE="tmp_ldapSearchWithEndUserEntries.txt"
+FINAL_USER_LIST="finaluserlist_entries.txt"
+STATUS_FILE_PATH=${STATUS_FILE_DIR}/${STATUS_FILE}
+LDIF_FILE_PATH=${TMP_DIR}/${LDIF_FILE_NAME}
+LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH=${TMP_DIR}/${LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE}
+TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH=${TMP_DIR}/${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE}
+LDAP_SEARCH_END_USER_FILE_PATH=${TMP_DIR}/${LDAP_SEARCH_END_USERS_RESULT_FILE}
+TMP_LDAP_SEARCH_END_USER_FILE_PATH=${TMP_DIR}/${TMP_LDAP_SEARCH_END_USERS_RESULT_FILE}
+FINAL_USER_LIST_PATH=${TMP_DIR}/${FINAL_USER_LIST}
+SSHGROUP="sshaccess"
+DN_ENTRY="dn:cn=${SSHGROUP},ou=groups,ou=accounts,$BASE_DN"
+LDAP_SEARCH_DN_FOR_GROUP="ou=groups,ou=accounts,$BASE_DN"
+LDAP_SEARCH_DN_FOR_USER="ou=people,ou=accounts,$BASE_DN"
+RM="/bin/rm -f"
+TOUCH="/bin/touch"
+MV="/bin/mv"
+ECHO="/bin/echo -e"
+SUCCESS=0
+FAILURE=1
+
+#Function to run group precheck
+f_groupPreCheck ()
+{
+	STAT=`getent group ${SSHGROUP}`
+	if [ $? -ne ${SUCCESS} ]
+	then
+		return ${FAILURE}
+	else 
+		return ${SUCCESS}
+	fi
+
+}
+
+#Function for logging and exiting for different scenarios
+f_logAndFailWithStatus ()
+{
+EXIT_VALUE=$1
+STR="$2"
+	if [ $EXIT_VALUE -ne $SUCCESS ]
+	then        
+		 ${ECHO} "${STR}" 
+		 f_removeFiles
+		exit ${EXIT_VALUE}
+	fi
+}
+
+#Function to remove all files used in the script in all cases
+f_removeFiles() {
+	[ -f ${LDIF_FILE_PATH} ] && ${RM} ${LDIF_FILE_PATH}
+	[ -f ${FINAL_USER_FILE_PATH} ] && ${RM} ${FINAL_USER_LIST_PATH}
+	[ -f ${LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH} ] && ${RM} ${LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH}
+	[ -f ${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH} ] && ${RM} ${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH}
+	[ -f ${TMP_LDAP_SEARCH_END_USER_FILE_PATH} ] && ${RM} ${TMP_LDAP_SEARCH_END_USER_FILE_PATH}
+	[ -f ${LDAP_SEARCH_END_USER_FILE_PATH} ] && ${RM} ${LDAP_SEARCH_END_USER_FILE_PATH} 
+}
+
+
+#Compare hardcoded system user entries (which are required to associate to sshaccess group) with all LDAP user entries already associated to sshaccess.
+#Add the system users which are NOT associated to sshaccess to the final list
+f_compareLDAP_Entries ()
+{
+	[ -f ${LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH} ] && rm -f ${LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH}
+	[ -f ${FINAL_USER_LIST_PATH} ] && rm -f ${FINAL_USER_LIST_PATH}
+	[ -f ${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH} ] && ${RM} ${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH}	
+
+	ldapsearch -LLL -x -H ldap://$LB_FQDN -D "$DIRSRV_USER" -w "$DIRSRV_USER_PWD" -b $LDAP_SEARCH_DN_FOR_GROUP cn=${SSHGROUP} memberUid > $LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH
+	LDAP_SEARCH_RESULT=$?
+	if [ ${LDAP_SEARCH_RESULT} -ne ${SUCCESS} ]
+        then
+                f_logAndFailWithStatus ${LDAP_SEARCH_RESULT} " [ERROR] Ldap search for the members associated to ${SSHGROUP} failed"
+        fi
+	cat $LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH |  grep -v "cn=${SSHGROUP}" | awk '{print $2}'| awk 'NF' | sed 's/[ \t]*$//' |  sort > ${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH}
+	${MV} ${TMP_LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH} ${LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH}
+	comm -23  $SYSTEMUSERLIST_FILE_PATH $LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH > $FINAL_USER_LIST_PATH
+	
+}
+#Adding existing end user entries which has home directory to the final list
+#Return the final user count 
+
+f_addEndUsersTo_FinalList ()
+{
+	 [ -f ${LDAP_SEARCH_END_USER_FILE_PATH} ] && rm -f ${LDAP_SEARCH_END_USER_FILE_PATH}
+	 [ -f ${TMP_LDAP_SEARCH_END_USER_FILE_PATH} ] && ${RM} ${TMP_LDAP_SEARCH_END_USER_FILE_PATH}
+
+	 ldapsearch -LLL -x -H ldap://$LB_FQDN -D "$DIRSRV_USER" -w "$DIRSRV_USER_PWD" -b $LDAP_SEARCH_DN_FOR_USER '(& (!(homeDirectory=*NA*)) (!(uidNumber<=10000)))' uid  > $LDAP_SEARCH_END_USER_FILE_PATH 
+	 cat $LDAP_SEARCH_END_USER_FILE_PATH |  grep -v "dn:" | awk '{print $2}' | awk 'NF' | sort > ${TMP_LDAP_SEARCH_END_USER_FILE_PATH}
+	 ${MV} ${TMP_LDAP_SEARCH_END_USER_FILE_PATH} ${LDAP_SEARCH_END_USER_FILE_PATH}	
+	 comm -23  $LDAP_SEARCH_END_USER_FILE_PATH $LDAP_SEARCH_FOR_ALL_USER_ENTRIES_FILE_PATH >> $FINAL_USER_LIST_PATH
+	 FINAL_USER_LIST_COUNT=`cat $FINAL_USER_LIST_PATH | wc -l`
+	 return ${FINAL_USER_LIST_COUNT}
+
+}
+#Creation of LDIF file containing the system user entries 
+f_createLDIF_File ()
+{
+	[ -f ${LDIF_FILE_PATH} ] && ${RM} ${LDIF_FILE_PATH}		
+	${TOUCH} ${LDIF_FILE_PATH} 
+	f_logAndFailWithStatus $? "Creation of ${LDIF_FILE_PATH} failed"
+	${ECHO} ${DN_ENTRY} >> ${LDIF_FILE_PATH}
+	f_logAndFailWithStatus $? "Creation of ${LDIF_FILE_PATH} failed"
+	${ECHO} "changetype: modify" >> ${LDIF_FILE_PATH}
+	f_logAndFailWithStatus $? "Updation of modify command to ${LDIF_FILE_PATH} failed"
+	${ECHO} "add: memberUid" >> ${LDIF_FILE_PATH}
+        f_logAndFailWithStatus $? "Updation of add: memberUid command to ${LDIF_FILE_PATH} failed"
+	IFS=' '
+	while read entry ;
+	do
+		${ECHO} "memberUid: ${entry}" >> ${LDIF_FILE_PATH}
+		f_logAndFailWithStatus $? "Updation of memberUid command to ${LDIF_FILE_PATH} failed"
+	done < $FINAL_USER_LIST_PATH
+}
+
+#Running LDAP modify command with the LDIF file as input
+f_ldapModify_Command ()
+{
+	ldapmodify -H ldap://$LB_FQDN -axc -D "$DIRSRV_USER" -w "$DIRSRV_USER_PWD" -f $LDIF_FILE_PATH
+	LDAP_MODIFY_RESULT=$?
+	if  [ ${LDAP_MODIFY_RESULT} -ne ${SUCCESS} ]  
+	then
+		f_logAndFailWithStatus ${LDAP_MODIFY_RESULT} "\n[ERROR] Ldap modify command failed "
+	fi
+}
+
+###########MAIN##############
+#############################
+if [ -f ${STATUS_FILE_PATH}   ] 
+then 
+	${ECHO} "\n[INFO] The script already ran as part of install/upgrade no need to run it again"
+	exit ${SUCCESS}
+else
+	f_groupPreCheck
+	RETURN_GROUP_PRECHECK=$?
+	if [ ${RETURN_GROUP_PRECHECK} -eq ${SUCCESS} ]
+	then
+		f_compareLDAP_Entries
+		f_addEndUsersTo_FinalList
+		RETURN_USER_COUNT=$?
+		if [ ${RETURN_USER_COUNT} -eq ${SUCCESS} ]
+		then
+			${ECHO}	"\n[INFO] All Users already attached to the group"
+		else
+			f_createLDIF_File
+			f_ldapModify_Command
+			EXIT_CODE=${SUCCESS}
+		fi 
+		${ECHO} "\n[INFO] Users successfully associated to the group"
+		f_removeFiles
+		${TOUCH} ${STATUS_FILE_PATH}
+		${ECHO} "\n\t\t\t\t ========OES.PROC.SM_ADD_USERS_TO_SSHACCESS_GROUP Status Check File======== \n\nThis file is a status check file, to see if the procedure OES.PROC.SM_ADD_USERS_TO_SSHACESS_GROUP has ran. This procedure associates all the dirsrv users who need SSH/SFTP access to group sshaccess" >> ${STATUS_FILE_PATH}
+		exit ${SUCCESS}
+	else
+		${ECHO}	"\n[ERROR] ${SSHGROUP} does not exist exiting with success"
+		exit ${SUCCESS}
+	fi	
+fi
